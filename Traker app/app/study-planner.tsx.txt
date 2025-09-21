@@ -1,0 +1,376 @@
+import React, { useState } from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  ScrollView,
+  TextInput,
+  TouchableOpacity,
+  Alert,
+} from 'react-native';
+import { useStudy } from '@/hooks/study-context';
+import { router } from 'expo-router';
+import { Save, Clock, Target } from 'lucide-react-native';
+import { DEFAULT_EXAM_DATES } from '@/constants/subjects';
+
+export default function StudyPlannerScreen() {
+  const { subjects, studyPlans, updateStudyPlan, examDates } = useStudy();
+  const [planData, setPlanData] = useState<Record<string, {
+    dailyTarget: string;
+    priority: 'high' | 'medium' | 'low';
+  }>>(() => {
+    const initial: Record<string, { dailyTarget: string; priority: 'high' | 'medium' | 'low' }> = {};
+    if (studyPlans && Array.isArray(studyPlans)) {
+      studyPlans.forEach(plan => {
+        initial[plan.subjectId] = {
+          dailyTarget: (plan.dailyTarget / 60).toString(),
+          priority: plan.priority,
+        };
+      });
+    }
+    return initial;
+  });
+
+  const daysUntilNEET = Math.ceil(
+    (new Date(examDates?.NEET_PG || DEFAULT_EXAM_DATES.NEET_PG).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24)
+  );
+  const daysUntilINICET = Math.ceil(
+    (new Date(examDates?.INICET || DEFAULT_EXAM_DATES.INICET).getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24)
+  );
+
+  const handleSave = async () => {
+    const plans = Object.entries(planData).map(([subjectId, data]) => {
+      const dailyMinutes = parseFloat(data.dailyTarget) * 60 || 0;
+      return {
+        subjectId,
+        dailyTarget: dailyMinutes,
+        weeklyTarget: dailyMinutes * 7,
+        priority: data.priority,
+      };
+    });
+
+    for (const plan of plans) {
+      if (plan.dailyTarget > 0) {
+        await updateStudyPlan(plan);
+      }
+    }
+
+    Alert.alert('Success', 'Study plan updated successfully!', [
+      { text: 'OK', onPress: () => router.back() }
+    ]);
+  };
+
+  const updatePlanData = (subjectId: string, field: 'dailyTarget' | 'priority', value: any) => {
+    setPlanData(prev => ({
+      ...prev,
+      [subjectId]: {
+        ...prev[subjectId],
+        [field]: value,
+      }
+    }));
+  };
+
+  const getTotalDailyHours = () => {
+    return Object.values(planData).reduce((sum, data) => {
+      return sum + (parseFloat(data.dailyTarget) || 0);
+    }, 0);
+  };
+
+  const priorityColors = {
+    high: '#FF6B6B',
+    medium: '#FFA500',
+    low: '#4ECDC4',
+  };
+
+  return (
+    <ScrollView style={styles.container} showsVerticalScrollIndicator={false}>
+      {/* Exam Info */}
+      <View style={styles.examInfo}>
+        <Text style={styles.examTitle}>Exam Timeline</Text>
+        <View style={styles.examCards}>
+          <View style={styles.examCard}>
+            <Text style={styles.examName}>NEET PG</Text>
+            <Text style={styles.examDays}>{daysUntilNEET} days</Text>
+          </View>
+          <View style={styles.examCard}>
+            <Text style={styles.examName}>INICET</Text>
+            <Text style={styles.examDays}>{daysUntilINICET} days</Text>
+          </View>
+        </View>
+      </View>
+
+      {/* Daily Target Summary */}
+      <View style={styles.summaryCard}>
+        <Clock size={20} color="#4ECDC4" />
+        <Text style={styles.summaryText}>
+          Total Daily Target: {getTotalDailyHours().toFixed(1)} hours
+        </Text>
+      </View>
+
+      {/* Subject Planning */}
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Subject-wise Planning</Text>
+        <Text style={styles.sectionSubtext}>
+          Set daily study targets and priorities for each subject
+        </Text>
+
+        {subjects.map(subject => {
+          const data = planData[subject.id] || { dailyTarget: '', priority: 'medium' as const };
+          
+          return (
+            <View key={subject.id} style={styles.subjectPlan}>
+              <View style={styles.subjectHeader}>
+                <View style={[styles.subjectDot, { backgroundColor: subject.color }]} />
+                <Text style={styles.subjectName}>{subject.name}</Text>
+              </View>
+
+              <View style={styles.planInputs}>
+                <View style={styles.targetInput}>
+                  <Text style={styles.inputLabel}>Daily (hrs)</Text>
+                  <TextInput
+                    style={styles.input}
+                    placeholder="0"
+                    value={data.dailyTarget}
+                    onChangeText={(value) => updatePlanData(subject.id, 'dailyTarget', value)}
+                    keyboardType="decimal-pad"
+                  />
+                </View>
+
+                <View style={styles.prioritySection}>
+                  <Text style={styles.inputLabel}>Priority</Text>
+                  <View style={styles.priorityButtons}>
+                    {(['high', 'medium', 'low'] as const).map(priority => (
+                      <TouchableOpacity
+                        key={priority}
+                        style={[
+                          styles.priorityButton,
+                          data.priority === priority && {
+                            backgroundColor: priorityColors[priority],
+                          }
+                        ]}
+                        onPress={() => updatePlanData(subject.id, 'priority', priority)}
+                      >
+                        <Text style={[
+                          styles.priorityButtonText,
+                          data.priority === priority && styles.selectedPriorityText,
+                        ]}>
+                          {priority[0].toUpperCase()}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+              </View>
+
+              {data.dailyTarget && (
+                <Text style={styles.weeklyEstimate}>
+                  Weekly: {(parseFloat(data.dailyTarget) * 7).toFixed(1)} hours
+                </Text>
+              )}
+            </View>
+          );
+        })}
+      </View>
+
+      {/* Tips */}
+      <View style={styles.tipsCard}>
+        <Target size={20} color="#4ECDC4" />
+        <Text style={styles.tipsTitle}>Planning Tips</Text>
+        <Text style={styles.tipText}>• Allocate more time to weak subjects</Text>
+        <Text style={styles.tipText}>• Include revision time in your plan</Text>
+        <Text style={styles.tipText}>• Be realistic with your daily targets</Text>
+        <Text style={styles.tipText}>• Adjust plan based on mock test performance</Text>
+      </View>
+
+      {/* Save Button */}
+      <TouchableOpacity style={styles.saveButton} onPress={handleSave}>
+        <Save size={20} color="#FFFFFF" />
+        <Text style={styles.saveButtonText}>Save Plan</Text>
+      </TouchableOpacity>
+
+      <View style={styles.bottomPadding} />
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#F8F9FA',
+  },
+  examInfo: {
+    backgroundColor: '#FFFFFF',
+    margin: 16,
+    borderRadius: 16,
+    padding: 16,
+  },
+  examTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#1C1C1E',
+    marginBottom: 12,
+  },
+  examCards: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  examCard: {
+    flex: 1,
+    backgroundColor: '#F8F9FA',
+    borderRadius: 12,
+    padding: 12,
+    alignItems: 'center',
+  },
+  examName: {
+    fontSize: 14,
+    color: '#636366',
+    marginBottom: 4,
+  },
+  examDays: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#4ECDC4',
+  },
+  summaryCard: {
+    backgroundColor: '#4ECDC4',
+    marginHorizontal: 16,
+    marginBottom: 16,
+    borderRadius: 12,
+    padding: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  summaryText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  section: {
+    backgroundColor: '#FFFFFF',
+    marginHorizontal: 16,
+    marginBottom: 16,
+    borderRadius: 16,
+    padding: 16,
+  },
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#1C1C1E',
+    marginBottom: 4,
+  },
+  sectionSubtext: {
+    fontSize: 13,
+    color: '#8E8E93',
+    marginBottom: 16,
+  },
+  subjectPlan: {
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E5E5EA',
+  },
+  subjectHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  subjectDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 8,
+  },
+  subjectName: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#1C1C1E',
+  },
+  planInputs: {
+    flexDirection: 'row',
+    gap: 16,
+  },
+  targetInput: {
+    flex: 1,
+  },
+  inputLabel: {
+    fontSize: 12,
+    color: '#8E8E93',
+    marginBottom: 4,
+  },
+  input: {
+    backgroundColor: '#F8F9FA',
+    borderRadius: 8,
+    padding: 10,
+    fontSize: 14,
+    color: '#1C1C1E',
+    borderWidth: 1,
+    borderColor: '#E5E5EA',
+  },
+  prioritySection: {
+    flex: 1,
+  },
+  priorityButtons: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  priorityButton: {
+    flex: 1,
+    padding: 10,
+    borderRadius: 8,
+    backgroundColor: '#F8F9FA',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#E5E5EA',
+  },
+  priorityButtonText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#636366',
+  },
+  selectedPriorityText: {
+    color: '#FFFFFF',
+  },
+  weeklyEstimate: {
+    fontSize: 12,
+    color: '#4ECDC4',
+    marginTop: 8,
+  },
+  tipsCard: {
+    backgroundColor: '#FFFFFF',
+    marginHorizontal: 16,
+    marginBottom: 16,
+    borderRadius: 16,
+    padding: 16,
+  },
+  tipsTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#1C1C1E',
+    marginTop: 8,
+    marginBottom: 12,
+  },
+  tipText: {
+    fontSize: 14,
+    color: '#636366',
+    marginBottom: 8,
+    lineHeight: 20,
+  },
+  saveButton: {
+    backgroundColor: '#4ECDC4',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginHorizontal: 16,
+    padding: 16,
+    borderRadius: 12,
+    gap: 8,
+  },
+  saveButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  bottomPadding: {
+    height: 20,
+  },
+});

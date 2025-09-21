@@ -1,0 +1,377 @@
+import React, { useState } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  ActivityIndicator,
+  SafeAreaView,
+  Platform,
+  Alert,
+  TextInput,
+  KeyboardAvoidingView,
+  ScrollView,
+} from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
+import * as AppleAuthentication from 'expo-apple-authentication';
+import { useAuth } from '@/hooks/auth-context';
+import { useRouter } from 'expo-router';
+import { User } from 'lucide-react-native';
+
+export default function LoginScreen() {
+  const { signInLocally, signInWithApple, isLoading, isAppleSignInAvailable } = useAuth();
+  const router = useRouter();
+  const [localSigningIn, setLocalSigningIn] = useState(false);
+  const [appleSigningIn, setAppleSigningIn] = useState(false);
+  const [userName, setUserName] = useState('');
+  const [userEmail, setUserEmail] = useState('');
+
+  const handleLocalSignIn = async () => {
+    try {
+      setLocalSigningIn(true);
+      
+      // Use provided name/email or defaults
+      const name = userName.trim() || 'Student';
+      const email = userEmail.trim() || `student_${Date.now()}@local.device`;
+      
+      const result = await signInLocally(name, email);
+      
+      if (result && typeof result === 'object' && 'type' in result) {
+        if (result.type === 'success') {
+          // Success - navigate back
+          Alert.alert(
+            'Success!', 
+            'Your data will be saved locally on this device.',
+            [{ text: 'OK', onPress: () => router.back() }]
+          );
+        } else if (result.type === 'error') {
+          // Error occurred
+          const errorMessage = 'Failed to set up local storage. Please try again.';
+          Alert.alert('Error', errorMessage);
+        }
+      }
+    } catch (error) {
+      console.error('Local sign in error:', error);
+      Alert.alert('Error', 'An unexpected error occurred. Please try again.');
+    } finally {
+      setLocalSigningIn(false);
+    }
+  };
+
+  const handleAppleSignIn = async () => {
+    try {
+      setAppleSigningIn(true);
+      const result = await signInWithApple();
+      
+      if (result && typeof result === 'object' && 'type' in result) {
+        if (result.type === 'success') {
+          // Success - navigate back
+          router.back();
+        } else if (result.type === 'cancel') {
+          // User cancelled - do nothing
+          console.log('Apple sign in cancelled by user');
+        } else if (result.type === 'error') {
+          // Error occurred
+          const errorMessage = result.error || 'Failed to sign in with Apple. Please try again.';
+          Alert.alert('Sign In Error', errorMessage);
+        }
+      }
+    } catch (error) {
+      console.error('Apple sign in error:', error);
+      Alert.alert('Sign In Error', 'An unexpected error occurred. Please try again.');
+    } finally {
+      setAppleSigningIn(false);
+    }
+  };
+
+  const handleSkip = async () => {
+    // Create a local user without custom name/email
+    await handleLocalSignIn();
+  };
+
+  if (isLoading) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#4F46E5" />
+      </View>
+    );
+  }
+
+  return (
+    <LinearGradient
+      colors={['#4F46E5', '#7C3AED']}
+      style={styles.container}
+    >
+      <SafeAreaView style={styles.safeArea}>
+        <KeyboardAvoidingView 
+          style={styles.keyboardView}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
+          <ScrollView 
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+          >
+            <View style={styles.content}>
+              <View style={styles.header}>
+                <View style={styles.logoContainer}>
+                  <View style={styles.logo}>
+                    <Text style={styles.logoText}>📚</Text>
+                  </View>
+                </View>
+                <Text style={styles.title}>INICET & NEET PG</Text>
+                <Text style={styles.subtitle}>Study Tracker</Text>
+                <Text style={styles.description}>
+                  Save your study progress locally on this device
+                </Text>
+              </View>
+
+              <View style={styles.features}>
+                <View style={styles.featureItem}>
+                  <Text style={styles.featureIcon}>💾</Text>
+                  <Text style={styles.featureText}>Local Storage</Text>
+                </View>
+                <View style={styles.featureItem}>
+                  <Text style={styles.featureIcon}>📊</Text>
+                  <Text style={styles.featureText}>Progress Tracking</Text>
+                </View>
+                <View style={styles.featureItem}>
+                  <Text style={styles.featureIcon}>🎯</Text>
+                  <Text style={styles.featureText}>Performance Analytics</Text>
+                </View>
+              </View>
+
+              <View style={styles.inputContainer}>
+                <Text style={styles.inputLabel}>Personalize Your Profile (Optional)</Text>
+                <View style={styles.inputWrapper}>
+                  <User size={20} color="rgba(255, 255, 255, 0.6)" style={styles.inputIcon} />
+                  <TextInput
+                    style={styles.input}
+                    placeholder="Your Name"
+                    placeholderTextColor="rgba(255, 255, 255, 0.5)"
+                    value={userName}
+                    onChangeText={setUserName}
+                    autoCapitalize="words"
+                  />
+                </View>
+                <View style={styles.inputWrapper}>
+                  <Text style={styles.inputIcon}>@</Text>
+                  <TextInput
+                    style={styles.input}
+                    placeholder="Email (Optional)"
+                    placeholderTextColor="rgba(255, 255, 255, 0.5)"
+                    value={userEmail}
+                    onChangeText={setUserEmail}
+                    keyboardType="email-address"
+                    autoCapitalize="none"
+                  />
+                </View>
+              </View>
+
+              <View style={styles.buttonContainer}>
+                <TouchableOpacity
+                  style={styles.localButton}
+                  onPress={handleLocalSignIn}
+                  disabled={localSigningIn || appleSigningIn}
+                >
+                  {localSigningIn ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <>
+                      <Text style={styles.localIcon}>💾</Text>
+                      <Text style={styles.localButtonText}>Save Locally on Device</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+
+                {Platform.OS === 'ios' && isAppleSignInAvailable && (
+                  <AppleAuthentication.AppleAuthenticationButton
+                    buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+                    buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.WHITE}
+                    cornerRadius={12}
+                    style={styles.appleButton}
+                    onPress={handleAppleSignIn}
+                  />
+                )}
+
+                <TouchableOpacity
+                  style={styles.skipButton}
+                  onPress={handleSkip}
+                  disabled={localSigningIn || appleSigningIn}
+                >
+                  <Text style={styles.skipButtonText}>Quick Start (Use Defaults)</Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.disclaimer}>
+                Your data is stored locally on this device only.{Platform.OS === 'ios' ? '\nUse Apple Sign-In to sync across devices.' : ''}
+              </Text>
+            </View>
+          </ScrollView>
+        </KeyboardAvoidingView>
+      </SafeAreaView>
+    </LinearGradient>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  safeArea: {
+    flex: 1,
+  },
+  keyboardView: {
+    flex: 1,
+  },
+  scrollContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#F9FAFB',
+  },
+  content: {
+    flex: 1,
+    paddingHorizontal: 24,
+    justifyContent: 'center',
+    paddingVertical: 20,
+  },
+  header: {
+    alignItems: 'center',
+    marginBottom: 40,
+  },
+  logoContainer: {
+    marginBottom: 20,
+  },
+  logo: {
+    width: 80,
+    height: 80,
+    borderRadius: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  logoText: {
+    fontSize: 40,
+  },
+  title: {
+    fontSize: 28,
+    fontWeight: 'bold' as const,
+    color: '#FFFFFF',
+    marginBottom: 8,
+  },
+  subtitle: {
+    fontSize: 20,
+    color: 'rgba(255, 255, 255, 0.9)',
+    marginBottom: 16,
+  },
+  description: {
+    fontSize: 16,
+    color: 'rgba(255, 255, 255, 0.8)',
+    textAlign: 'center',
+    lineHeight: 24,
+    paddingHorizontal: 20,
+  },
+  features: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginBottom: 40,
+    paddingHorizontal: 10,
+  },
+  featureItem: {
+    alignItems: 'center',
+  },
+  featureIcon: {
+    fontSize: 32,
+    marginBottom: 8,
+  },
+  featureText: {
+    fontSize: 12,
+    color: 'rgba(255, 255, 255, 0.9)',
+    textAlign: 'center',
+  },
+  inputContainer: {
+    marginBottom: 30,
+  },
+  inputLabel: {
+    fontSize: 14,
+    color: 'rgba(255, 255, 255, 0.9)',
+    marginBottom: 12,
+    textAlign: 'center',
+    fontWeight: '500' as const,
+  },
+  inputWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  inputIcon: {
+    marginRight: 12,
+    fontSize: 18,
+    color: 'rgba(255, 255, 255, 0.6)',
+  },
+  input: {
+    flex: 1,
+    paddingVertical: 14,
+    fontSize: 16,
+    color: '#FFFFFF',
+  },
+  buttonContainer: {
+    marginBottom: 20,
+  },
+  localButton: {
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  localIcon: {
+    fontSize: 20,
+    marginRight: 12,
+  },
+  localButtonText: {
+    fontSize: 16,
+    fontWeight: '600' as const,
+    color: '#4F46E5',
+  },
+  skipButton: {
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  skipButtonText: {
+    fontSize: 16,
+    color: 'rgba(255, 255, 255, 0.9)',
+    fontWeight: '500' as const,
+  },
+  appleButton: {
+    height: 50,
+    marginBottom: 16,
+  },
+  disclaimer: {
+    fontSize: 12,
+    color: 'rgba(255, 255, 255, 0.6)',
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+
+});

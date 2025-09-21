@@ -1,0 +1,1775 @@
+import createContextHook from '@nkzw/create-context-hook';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useEffect, useState, useCallback } from 'react';
+import { AppState, Platform } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
+import { StudySession, TestScore, Subject, StudyPlan, DailyStats, User } from '@/types/study';
+
+
+// Helper functions for merging data
+const mergeSessions = (local: StudySession[], cloud: StudySession[]): StudySession[] => {
+  const sessionMap = new Map<string, StudySession>();
+  
+  // Add local sessions
+  local.forEach(session => {
+    if (session && session.id) {
+      sessionMap.set(session.id, session);
+    }
+  });
+  
+  // Add/override with cloud sessions
+  cloud.forEach(session => {
+    if (session && session.id) {
+      sessionMap.set(session.id, session);
+    }
+  });
+  
+  return Array.from(sessionMap.values()).sort((a, b) => 
+    new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
+  );
+};
+
+const mergeScores = (local: TestScore[], cloud: TestScore[]): TestScore[] => {
+  const scoreMap = new Map<string, TestScore>();
+  
+  // Add local scores
+  local.forEach(score => {
+    if (score && score.id) {
+      scoreMap.set(score.id, score);
+    }
+  });
+  
+  // Add/override with cloud scores
+  cloud.forEach(score => {
+    if (score && score.id) {
+      scoreMap.set(score.id, score);
+    }
+  });
+  
+  return Array.from(scoreMap.values()).sort((a, b) => 
+    new Date(b.date).getTime() - new Date(a.date).getTime()
+  );
+};
+
+const getStorageKeys = (userId?: string) => {
+  const prefix = userId ? `user_${userId}_` : 'guest_';
+  return {
+    STUDY_SESSIONS: `${prefix}study_sessions`,
+    TEST_SCORES: `${prefix}test_scores`,
+    SUBJECTS: `${prefix}subjects`,
+    STUDY_PLANS: `${prefix}study_plans`,
+    ACTIVE_SESSION: `${prefix}active_session`,
+    EXAM_DATES: `${prefix}exam_dates`,
+    // Cloud sync keys for authenticated users
+    CLOUD_STUDY_SESSIONS: `cloud_${prefix}study_sessions`,
+    CLOUD_TEST_SCORES: `cloud_${prefix}test_scores`,
+    CLOUD_SUBJECTS: `cloud_${prefix}subjects`,
+    CLOUD_STUDY_PLANS: `cloud_${prefix}study_plans`,
+    CLOUD_EXAM_DATES: `cloud_${prefix}exam_dates`,
+    LAST_CLOUD_SYNC: `${prefix}last_cloud_sync`,
+  };
+};
+
+export const [StudyProvider, useStudy] = createContextHook(() => {
+  const [currentUser, setCurrentUser] = useState<User | null | undefined>(undefined);
+  const [studySessions, setStudySessions] = useState<StudySession[]>([]);
+  const [testScores, setTestScores] = useState<TestScore[]>([]);
+  const [subjects, setSubjects] = useState<Subject[]>([]);
+  const [studyPlans, setStudyPlans] = useState<StudyPlan[]>([]);
+  const [activeSession, setActiveSession] = useState<{
+    subjectId: string;
+    startTime: string;
+    pausedTime?: number; // Total paused time in milliseconds
+    lastPauseStart?: string; // When the current pause started
+    isPaused?: boolean;
+  } | null>(null);
+  const [examDates, setExamDates] = useState<{
+    NEET_PG: string;
+    INICET: string;
+  }>({ NEET_PG: '', INICET: '' });
+  const [isLoading, setIsLoading] = useState(true);
+
+  // Enhanced data backup system to prevent data loss
+  const createDataBackup = useCallback(async (label: string) => {
+    try {
+      const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+      const timestamp = new Date().toISOString();
+      const backupKey = `backup_${timestamp}_${label}`;
+      
+      const [sessions, scores, subjects, plans, dates] = await Promise.all([
+        AsyncStorage.getItem(STORAGE_KEYS.STUDY_SESSIONS),
+        AsyncStorage.getItem(STORAGE_KEYS.TEST_SCORES),
+        AsyncStorage.getItem(STORAGE_KEYS.SUBJECTS),
+        AsyncStorage.getItem(STORAGE_KEYS.STUDY_PLANS),
+        AsyncStorage.getItem(STORAGE_KEYS.EXAM_DATES),
+      ]);
+      
+      const backup = {
+        timestamp,
+        userId: currentUser?.id || 'guest',
+        sessions,
+        scores,
+        subjects,
+        plans,
+        dates,
+      };
+      
+      await AsyncStorage.setItem(backupKey, JSON.stringify(backup));
+      console.log('Data backup created:', backupKey);
+      
+      // Keep only last 5 backups to save space
+      const allKeys = await AsyncStorage.getAllKeys();
+      const backupKeys = allKeys.filter(key => key.startsWith('backup_')).sort();
+      if (backupKeys.length > 5) {
+        const keysToRemove = backupKeys.slice(0, backupKeys.length - 5);
+        await AsyncStorage.multiRemove(keysToRemove);
+      }
+      
+      return backupKey;
+    } catch (error) {
+      console.error('Error creating data backup:', error);
+      return null;
+    }
+  }, [currentUser?.id]);
+
+  const safeJsonParse = (data: string | null | undefined, fallback: any = null) => {
+    if (!data || data === 'undefined' || data === 'null') return fallback;
+    
+    try {
+      // If data is already an object, return it directly
+      if (typeof data === 'object' && data !== null) {
+        return data;
+      }
+      
+      // Convert to string if needed and trim
+      const dataStr = typeof data === 'string' ? data : String(data);
+      const trimmed = dataStr.trim();
+      
+      // Check for empty string after trimming
+      if (trimmed === '') return fallback;
+      
+      // Enhanced corruption detection patterns
+      const corruptionPatterns = [
+        /^object$/i,                    // Just "object"
+        /^object\s/i,                  // "object " (with space)
+        /^object Object$/i,            // "object Object"
+        /^\[object Object\]$/i,       // "[object Object]"
+        /^\[object\s+\w+\]$/i,         // "[object Something]"
+        /^NaN$/i,                      // "NaN"
+        /^undefined$/i,                // "undefined"
+        /^function/i,                  // Function strings
+        /^\w+\s+object/i,              // "something object"
+        /object\s*Object/i,            // Various "object Object" patterns
+        /^[a-zA-Z]+\s+[a-zA-Z]+$/,     // Two words (likely corrupted)
+      ];
+      
+      const isCorrupted = corruptionPatterns.some(pattern => pattern.test(trimmed));
+      
+      if (isCorrupted) {
+        console.warn('Detected corrupted data pattern, returning fallback:', trimmed.substring(0, 50));
+        return fallback;
+      }
+      
+      // Check if it looks like valid JSON structure
+      const startsWithValidJson = trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"');
+      const isValidPrimitive = ['true', 'false', 'null'].includes(trimmed.toLowerCase()) || /^-?\d*\.?\d+$/.test(trimmed);
+      
+      if (!startsWithValidJson && !isValidPrimitive) {
+        console.warn('Data does not look like valid JSON, returning fallback:', trimmed.substring(0, 50));
+        return fallback;
+      }
+      
+      // Try to parse JSON with enhanced error handling
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (parseError) {
+        // Log the specific error for debugging
+        if (typeof parseError === 'object' && parseError !== null && 'message' in parseError) {
+          const errorMessage = (parseError as Error).message;
+          console.warn('JSON parse error:', errorMessage, 'Data preview:', trimmed.substring(0, 100));
+          
+          // Return fallback for any JSON syntax errors - be more aggressive
+          console.warn('Returning fallback due to JSON parse error');
+          return fallback;
+        }
+        console.warn('Unknown parse error, returning fallback');
+        return fallback;
+      }
+      
+      // Additional validation after parsing
+      if (parsed === null || parsed === undefined) {
+        return fallback;
+      }
+      
+      return parsed;
+    } catch (error) {
+      console.warn('Critical error in safeJsonParse, returning fallback. Error:', error, 'Data preview:', data?.toString().substring(0, 50));
+      return fallback;
+    }
+  };
+
+
+
+  const loadCurrentUser = useCallback(async () => {
+    try {
+      // Try both 'user_data' and 'USER' keys for compatibility
+      let userData = await AsyncStorage.getItem('user_data');
+      if (!userData) {
+        userData = await AsyncStorage.getItem('USER');
+      }
+      
+      const parsedUser = safeJsonParse(userData, null);
+      
+      if (parsedUser && parsedUser.id && parsedUser.email) {
+        console.log('Study context: User loaded:', parsedUser.email);
+        setCurrentUser(parsedUser);
+        return parsedUser;
+      }
+      
+      console.log('Study context: No user found');
+      setCurrentUser(null); // No user logged in
+      return null;
+    } catch (error) {
+      console.error('Error loading current user:', error);
+      // Clear corrupted user data
+      try {
+        await AsyncStorage.removeItem('user_data');
+        await AsyncStorage.removeItem('USER');
+      } catch (clearError) {
+        console.error('Error clearing corrupted user data:', clearError);
+      }
+      setCurrentUser(null);
+      return null;
+    }
+  }, []);
+
+
+
+  const loadData = useCallback(async () => {
+    try {
+      // Create backup before loading to preserve current state
+      await createDataBackup('before_load');
+      
+      const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+      console.log('loadData - Loading data for user:', currentUser?.id || 'guest');
+      
+      // Try to load from multiple sources to recover data if needed
+      const loadFromMultipleSources = async (key: string) => {
+        const sources = [
+          STORAGE_KEYS[key as keyof typeof STORAGE_KEYS],
+          // Try cloud version as backup
+          STORAGE_KEYS[`CLOUD_${key}` as keyof typeof STORAGE_KEYS],
+          // Try guest version if user version fails
+          ...(currentUser?.id ? [getStorageKeys().STUDY_SESSIONS] : []),
+        ].filter(Boolean);
+        
+        for (const source of sources) {
+          try {
+            const data = await AsyncStorage.getItem(source as string);
+            if (data && data !== 'null' && data !== '[]' && data.trim() !== '') {
+              const parsed = safeJsonParse(data, null);
+              if (parsed && (Array.isArray(parsed) ? parsed.length > 0 : Object.keys(parsed).length > 0)) {
+                console.log(`Found data in ${source}:`, Array.isArray(parsed) ? parsed.length : 'object');
+                return parsed;
+              }
+            }
+          } catch (error) {
+            console.warn(`Failed to load from ${source}:`, error);
+          }
+        }
+        return null;
+      };
+      
+      // Load all data with fallback sources
+      const [sessionsData, scoresData, subjectsData, plansData, activeData, datesData] = await Promise.all([
+        loadFromMultipleSources('STUDY_SESSIONS'),
+        loadFromMultipleSources('TEST_SCORES'),
+        loadFromMultipleSources('SUBJECTS'),
+        loadFromMultipleSources('STUDY_PLANS'),
+        AsyncStorage.getItem(STORAGE_KEYS.ACTIVE_SESSION),
+        loadFromMultipleSources('EXAM_DATES'),
+      ]);
+      
+      console.log('loadData - Raw data loaded');
+
+      // Parse data safely with fallbacks
+      let parsedSessions = Array.isArray(sessionsData) ? sessionsData : safeJsonParse(JSON.stringify(sessionsData), []);
+      let parsedScores = Array.isArray(scoresData) ? scoresData : safeJsonParse(JSON.stringify(scoresData), []);
+      let parsedActive = safeJsonParse(activeData, null);
+      let parsedDates = typeof datesData === 'object' ? datesData : safeJsonParse(JSON.stringify(datesData), null);
+      let parsedSubjects = Array.isArray(subjectsData) ? subjectsData : safeJsonParse(JSON.stringify(subjectsData), null);
+      let parsedPlans = Array.isArray(plansData) ? plansData : safeJsonParse(JSON.stringify(plansData), []);
+      
+      // Validate and clean sessions
+      if (Array.isArray(parsedSessions)) {
+        parsedSessions = parsedSessions.filter(s => s && s.id && s.subjectId && s.startTime && typeof s.duration === 'number');
+      } else {
+        parsedSessions = [];
+      }
+      
+      // Validate and clean scores
+      if (Array.isArray(parsedScores)) {
+        parsedScores = parsedScores.filter(s => s && s.id && s.testName);
+      } else {
+        parsedScores = [];
+      }
+      
+      // Validate and clean plans
+      if (Array.isArray(parsedPlans)) {
+        parsedPlans = parsedPlans.filter(p => p && p.subjectId);
+      } else {
+        parsedPlans = [];
+      }
+
+      // Initialize subjects if not exists or invalid
+      if (!parsedSubjects || !Array.isArray(parsedSubjects) || parsedSubjects.length === 0) {
+        console.log('No subjects found in storage, will initialize defaults after load');
+        parsedSubjects = [];
+      }
+      
+      // Initialize exam dates if not exists
+      if (!parsedDates) {
+        parsedDates = { NEET_PG: '', INICET: '' };
+      }
+      
+      // ALWAYS recalculate subject completed hours from sessions
+      const recalculatedSubjects = parsedSubjects.map((subject: Subject) => {
+        const subjectSessions = parsedSessions.filter((s: StudySession) => s && s.subjectId === subject.id);
+        const completedMinutes = subjectSessions.reduce((sum: number, s: StudySession) => {
+          const duration = typeof s.duration === 'number' ? s.duration : 0;
+          return sum + Math.max(0, duration);
+        }, 0);
+        return {
+          ...subject,
+          completedHours: completedMinutes / 60,
+        };
+      });
+
+      // Update state atomically
+      setStudySessions(parsedSessions);
+      setTestScores(parsedScores);
+      setActiveSession(parsedActive);
+      setStudyPlans(parsedPlans);
+      setExamDates(parsedDates);
+      setSubjects(recalculatedSubjects);
+      
+      // Save recalculated data back to ensure consistency only if we have data
+      const savePromises = [];
+      if (recalculatedSubjects.length > 0) {
+        savePromises.push(AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(recalculatedSubjects)));
+      }
+      if (parsedSessions.length > 0) {
+        savePromises.push(AsyncStorage.setItem(STORAGE_KEYS.STUDY_SESSIONS, JSON.stringify(parsedSessions)));
+      }
+      if (parsedDates.NEET_PG || parsedDates.INICET) {
+        savePromises.push(AsyncStorage.setItem(STORAGE_KEYS.EXAM_DATES, JSON.stringify(parsedDates)));
+      }
+      
+      if (savePromises.length > 0) {
+        await Promise.all(savePromises);
+      }
+      
+      console.log('loadData - Data loaded successfully:', {
+        sessions: parsedSessions.length,
+        scores: parsedScores.length,
+        subjects: recalculatedSubjects.length,
+        plans: parsedPlans.length,
+        user: currentUser?.id || 'guest'
+      });
+      
+      // Force update state to ensure UI refreshes
+      console.log('loadData - Forcing state update...');
+      
+      // Log first few items for debugging
+      if (parsedSessions.length > 0) {
+        console.log('loadData - Sample session:', parsedSessions[0]);
+        console.log('loadData - All session IDs:', parsedSessions.map((s: any) => s.id));
+      }
+      if (recalculatedSubjects.length > 0) {
+        console.log('loadData - Sample subject:', recalculatedSubjects[0]);
+        console.log('loadData - All subject IDs:', recalculatedSubjects.map((s: any) => s.id));
+      }
+      
+      // Log current state after setting
+      setTimeout(() => {
+        console.log('loadData - State after update:', {
+          sessionsInState: studySessions.length,
+          subjectsInState: subjects.length,
+          isLoadingState: isLoading
+        });
+      }, 100);
+    } catch (error) {
+      console.error('Error loading data:', error);
+      // Try to recover from backup before resetting
+      try {
+        const allKeys = await AsyncStorage.getAllKeys();
+        const backupKeys = allKeys.filter(key => key.startsWith('backup_')).sort().reverse();
+        
+        if (backupKeys.length > 0) {
+          console.log('Attempting to restore from backup:', backupKeys[0]);
+          const backupData = await AsyncStorage.getItem(backupKeys[0]);
+          const backup = safeJsonParse(backupData, null);
+          
+          if (backup && backup.sessions) {
+            const sessions = safeJsonParse(backup.sessions, []);
+            const scores = safeJsonParse(backup.scores, []);
+            const subjects = safeJsonParse(backup.subjects, []);
+            const plans = safeJsonParse(backup.plans, []);
+            const dates = safeJsonParse(backup.dates, { NEET_PG: '', INICET: '' });
+            
+            if (sessions.length > 0 || scores.length > 0 || subjects.length > 0) {
+              console.log('Restoring from backup successful');
+              setStudySessions(sessions);
+              setTestScores(scores);
+              setSubjects(subjects);
+              setStudyPlans(plans);
+              setExamDates(dates);
+              setActiveSession(null);
+              return;
+            }
+          }
+        }
+      } catch (backupError) {
+        console.error('Backup restoration failed:', backupError);
+      }
+      
+      // Only reset if backup restoration failed
+      console.warn('Resetting to empty state as last resort');
+      setStudySessions([]);
+      setTestScores([]);
+      setActiveSession(null);
+      setStudyPlans([]);
+      setExamDates({ NEET_PG: '', INICET: '' });
+      setSubjects([]);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [currentUser?.id, createDataBackup]);
+
+  // Clear corrupted data function
+  const clearCorruptedData = useCallback(async () => {
+    try {
+      console.log('Clearing all potentially corrupted data...');
+      
+      // Get ALL keys from AsyncStorage to check for corruption
+      const allKeys = await AsyncStorage.getAllKeys();
+      const corruptedKeys = [];
+      
+      for (const key of allKeys) {
+        try {
+          const data = await AsyncStorage.getItem(key);
+          if (data && (
+            data.includes('[object Object]') || 
+            data.includes('object Object') ||
+            data.startsWith('object') || 
+            data.startsWith('[object') ||
+            data.includes('NaN') ||
+            data.includes('undefined') ||
+            /^object\s/.test(data) ||
+            /^\w+\s*object/i.test(data) ||
+            data.match(/^[a-zA-Z]+$/) || // Single word that's not JSON
+            // Check for other corruption patterns
+            (data.length > 0 && !data.startsWith('{') && !data.startsWith('[') && !data.startsWith('"') && data !== 'true' && data !== 'false' && isNaN(Number(data)) && data.trim() !== '' && !/^-?\d*\.?\d+$/.test(data.trim()))
+          )) {
+            console.warn('Found corrupted data in key:', key, 'Data preview:', data.substring(0, 50));
+            corruptedKeys.push(key);
+          }
+        } catch (error) {
+          console.warn('Error checking key:', key, error);
+          corruptedKeys.push(key);
+        }
+      }
+      
+      if (corruptedKeys.length > 0) {
+        console.log('Removing corrupted keys:', corruptedKeys);
+        await AsyncStorage.multiRemove(corruptedKeys);
+        
+        // After clearing corrupted data, reload from storage
+        await loadData();
+      }
+      
+      console.log('Corrupted data cleanup completed');
+    } catch (error) {
+      console.error('Error clearing corrupted data:', error);
+    }
+  }, [loadData]);
+
+  // iCloud backup function for iOS
+  const backupToiCloud = useCallback(async (data: any, key: string) => {
+    try {
+      if (Platform.OS !== 'ios') return;
+      
+      // Use SecureStore for iCloud backup on iOS
+      await SecureStore.setItemAsync(`icloud_${key}`, JSON.stringify(data), {
+        keychainService: 'StudyTrackerBackup',
+        requireAuthentication: false,
+      });
+      console.log(`Data backed up to iCloud: ${key}`);
+    } catch (error) {
+      console.warn('iCloud backup failed:', error);
+    }
+  }, []);
+
+  // Restore from iCloud function for iOS
+  const restoreFromiCloud = useCallback(async (key: string) => {
+    try {
+      if (Platform.OS !== 'ios') return null;
+      
+      console.log(`Attempting to restore from iCloud: icloud_${key}`);
+      
+      const data = await SecureStore.getItemAsync(`icloud_${key}`, {
+        keychainService: 'StudyTrackerBackup',
+        requireAuthentication: false,
+      });
+      
+      if (data) {
+        console.log(`Raw data found in iCloud for ${key}, length: ${data.length}`);
+        const parsed = safeJsonParse(data, null);
+        if (parsed) {
+          console.log(`Successfully parsed iCloud data for ${key}`);
+          return parsed;
+        } else {
+          console.warn(`Failed to parse iCloud data for ${key}`);
+        }
+      } else {
+        console.log(`No data found in iCloud for ${key}`);
+      }
+    } catch (error) {
+      console.warn('iCloud restore failed:', error);
+    }
+    return null;
+  }, []);
+
+  // Force restore all data from iCloud
+  const forceRestoreFromiCloud = useCallback(async () => {
+    if (Platform.OS !== 'ios' || !currentUser?.id) {
+      console.log('iCloud restore not available');
+      return false;
+    }
+    
+    try {
+      console.log('Force restoring all data from iCloud...');
+      
+      // Try to restore all data types from iCloud
+      const [iCloudSessions, iCloudScores, iCloudSubjects, iCloudPlans, iCloudDates] = await Promise.all([
+        restoreFromiCloud(`${currentUser.id}_sessions`),
+        restoreFromiCloud(`${currentUser.id}_scores`),
+        restoreFromiCloud(`${currentUser.id}_subjects`),
+        restoreFromiCloud(`${currentUser.id}_plans`),
+        restoreFromiCloud(`${currentUser.id}_dates`),
+      ]);
+      
+      let restoredAny = false;
+      const STORAGE_KEYS = getStorageKeys(currentUser.id);
+      
+      // Restore sessions
+      if (iCloudSessions && Array.isArray(iCloudSessions) && iCloudSessions.length > 0) {
+        console.log(`Restoring ${iCloudSessions.length} sessions from iCloud`);
+        setStudySessions(iCloudSessions);
+        await AsyncStorage.setItem(STORAGE_KEYS.STUDY_SESSIONS, JSON.stringify(iCloudSessions));
+        await AsyncStorage.setItem(STORAGE_KEYS.CLOUD_STUDY_SESSIONS, JSON.stringify(iCloudSessions));
+        restoredAny = true;
+      }
+      
+      // Restore scores
+      if (iCloudScores && Array.isArray(iCloudScores) && iCloudScores.length > 0) {
+        console.log(`Restoring ${iCloudScores.length} scores from iCloud`);
+        setTestScores(iCloudScores);
+        await AsyncStorage.setItem(STORAGE_KEYS.TEST_SCORES, JSON.stringify(iCloudScores));
+        await AsyncStorage.setItem(STORAGE_KEYS.CLOUD_TEST_SCORES, JSON.stringify(iCloudScores));
+        restoredAny = true;
+      }
+      
+      // Restore subjects
+      if (iCloudSubjects && Array.isArray(iCloudSubjects) && iCloudSubjects.length > 0) {
+        console.log(`Restoring ${iCloudSubjects.length} subjects from iCloud`);
+        
+        // Recalculate subject hours from sessions
+        const recalculatedSubjects = iCloudSubjects.map((subject: Subject) => {
+          const subjectSessions = ((iCloudSessions || studySessions) as StudySession[]).filter((s: StudySession) => 
+            s && s.subjectId === subject.id
+          );
+          const completedMinutes = subjectSessions.reduce((sum: number, s: StudySession) => {
+            const duration = typeof s.duration === 'number' ? s.duration : 0;
+            return sum + Math.max(0, duration);
+          }, 0);
+          return {
+            ...subject,
+            completedHours: completedMinutes / 60,
+          };
+        });
+        
+        setSubjects(recalculatedSubjects);
+        await AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(recalculatedSubjects));
+        await AsyncStorage.setItem(STORAGE_KEYS.CLOUD_SUBJECTS, JSON.stringify(recalculatedSubjects));
+        restoredAny = true;
+      }
+      
+      // Restore plans
+      if (iCloudPlans && Array.isArray(iCloudPlans) && iCloudPlans.length > 0) {
+        console.log(`Restoring ${iCloudPlans.length} plans from iCloud`);
+        setStudyPlans(iCloudPlans);
+        await AsyncStorage.setItem(STORAGE_KEYS.STUDY_PLANS, JSON.stringify(iCloudPlans));
+        await AsyncStorage.setItem(STORAGE_KEYS.CLOUD_STUDY_PLANS, JSON.stringify(iCloudPlans));
+        restoredAny = true;
+      }
+      
+      // Restore exam dates
+      if (iCloudDates && typeof iCloudDates === 'object') {
+        console.log('Restoring exam dates from iCloud');
+        setExamDates(iCloudDates);
+        await AsyncStorage.setItem(STORAGE_KEYS.EXAM_DATES, JSON.stringify(iCloudDates));
+        await AsyncStorage.setItem(STORAGE_KEYS.CLOUD_EXAM_DATES, JSON.stringify(iCloudDates));
+        restoredAny = true;
+      }
+      
+      if (restoredAny) {
+        console.log('Successfully restored data from iCloud');
+        await AsyncStorage.setItem(STORAGE_KEYS.LAST_CLOUD_SYNC, new Date().toISOString());
+      } else {
+        console.log('No data found in iCloud to restore');
+      }
+      
+      return restoredAny;
+    } catch (error) {
+      console.error('Error during iCloud restore:', error);
+      return false;
+    }
+  }, [currentUser?.id, restoreFromiCloud]);
+
+  // Enhanced cloud sync function with iCloud backup
+  const syncWithCloud = useCallback(async (userId: string) => {
+    try {
+      console.log('Syncing data with cloud for user:', userId);
+      
+      const STORAGE_KEYS = getStorageKeys(userId);
+      
+      // Get all data in parallel
+      const [localSessions, localScores, localSubjects, localPlans, localDates,
+              cloudSessions, cloudScores, cloudSubjects, cloudPlans, cloudDates] = await Promise.all([
+        AsyncStorage.getItem(STORAGE_KEYS.STUDY_SESSIONS),
+        AsyncStorage.getItem(STORAGE_KEYS.TEST_SCORES),
+        AsyncStorage.getItem(STORAGE_KEYS.SUBJECTS),
+        AsyncStorage.getItem(STORAGE_KEYS.STUDY_PLANS),
+        AsyncStorage.getItem(STORAGE_KEYS.EXAM_DATES),
+        AsyncStorage.getItem(STORAGE_KEYS.CLOUD_STUDY_SESSIONS),
+        AsyncStorage.getItem(STORAGE_KEYS.CLOUD_TEST_SCORES),
+        AsyncStorage.getItem(STORAGE_KEYS.CLOUD_SUBJECTS),
+        AsyncStorage.getItem(STORAGE_KEYS.CLOUD_STUDY_PLANS),
+        AsyncStorage.getItem(STORAGE_KEYS.CLOUD_EXAM_DATES),
+      ]);
+      
+      // Parse local data
+      let parsedLocalSessions = safeJsonParse(localSessions, []);
+      let parsedLocalScores = safeJsonParse(localScores, []);
+      let parsedLocalSubjects = safeJsonParse(localSubjects, null);
+      let parsedLocalPlans = safeJsonParse(localPlans, []);
+      let parsedLocalDates = safeJsonParse(localDates, null);
+      
+      // Parse cloud data
+      let parsedCloudSessions = safeJsonParse(cloudSessions, []);
+      let parsedCloudScores = safeJsonParse(cloudScores, []);
+      let parsedCloudSubjects = safeJsonParse(cloudSubjects, null);
+      let parsedCloudPlans = safeJsonParse(cloudPlans, []);
+      let parsedCloudDates = safeJsonParse(cloudDates, null);
+      
+      // Validate arrays
+      if (!Array.isArray(parsedLocalSessions)) parsedLocalSessions = [];
+      if (!Array.isArray(parsedLocalScores)) parsedLocalScores = [];
+      if (!Array.isArray(parsedLocalPlans)) parsedLocalPlans = [];
+      if (!Array.isArray(parsedCloudSessions)) parsedCloudSessions = [];
+      if (!Array.isArray(parsedCloudScores)) parsedCloudScores = [];
+      if (!Array.isArray(parsedCloudPlans)) parsedCloudPlans = [];
+      
+      // Filter out invalid sessions before merging
+      parsedLocalSessions = parsedLocalSessions.filter((s: any) => s && s.id && s.subjectId && typeof s.duration === 'number');
+      parsedCloudSessions = parsedCloudSessions.filter((s: any) => s && s.id && s.subjectId && typeof s.duration === 'number');
+      
+      // Merge strategy: Use timestamp-based merging for better consistency
+      const mergedSessions = mergeSessions(parsedLocalSessions, parsedCloudSessions);
+      const mergedScores = mergeScores(parsedLocalScores, parsedCloudScores);
+      const mergedPlans = [...parsedCloudPlans, ...parsedLocalPlans].filter((plan, index, self) => 
+        index === self.findIndex(p => p.subjectId === plan.subjectId)
+      );
+      const mergedDates = parsedCloudDates || parsedLocalDates || { NEET_PG: '', INICET: '' };
+      
+      // Merge subjects or initialize
+      let mergedSubjects = parsedCloudSubjects || parsedLocalSubjects;
+      if (!mergedSubjects || !Array.isArray(mergedSubjects)) {
+        mergedSubjects = [];
+      }
+      
+      // ALWAYS recalculate subject completed hours from merged sessions
+      mergedSubjects = mergedSubjects.map((subject: Subject) => {
+        const subjectSessions = mergedSessions.filter((s: StudySession) => s && s.subjectId === subject.id);
+        const completedMinutes = subjectSessions.reduce((sum: number, s: StudySession) => {
+          const duration = typeof s.duration === 'number' ? s.duration : 0;
+          return sum + Math.max(0, duration);
+        }, 0);
+        return {
+          ...subject,
+          completedHours: completedMinutes / 60,
+        };
+      });
+      
+      // Save merged data to both local and cloud storage atomically
+      await Promise.all([
+        AsyncStorage.setItem(STORAGE_KEYS.STUDY_SESSIONS, JSON.stringify(mergedSessions)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_STUDY_SESSIONS, JSON.stringify(mergedSessions)),
+        AsyncStorage.setItem(STORAGE_KEYS.TEST_SCORES, JSON.stringify(mergedScores)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_TEST_SCORES, JSON.stringify(mergedScores)),
+        AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(mergedSubjects)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_SUBJECTS, JSON.stringify(mergedSubjects)),
+        AsyncStorage.setItem(STORAGE_KEYS.STUDY_PLANS, JSON.stringify(mergedPlans)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_STUDY_PLANS, JSON.stringify(mergedPlans)),
+        AsyncStorage.setItem(STORAGE_KEYS.EXAM_DATES, JSON.stringify(mergedDates)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_EXAM_DATES, JSON.stringify(mergedDates)),
+        AsyncStorage.setItem(STORAGE_KEYS.LAST_CLOUD_SYNC, new Date().toISOString())
+      ]);
+      
+      // Backup to iCloud on iOS
+      if (Platform.OS === 'ios') {
+        try {
+          await Promise.all([
+            backupToiCloud(mergedSessions, `${userId}_sessions`),
+            backupToiCloud(mergedScores, `${userId}_scores`),
+            backupToiCloud(mergedSubjects, `${userId}_subjects`),
+            backupToiCloud(mergedPlans, `${userId}_plans`),
+            backupToiCloud(mergedDates, `${userId}_dates`),
+          ]);
+          console.log('iCloud backup completed successfully');
+        } catch (error) {
+          console.warn('iCloud backup during sync failed:', error);
+        }
+      }
+      
+      console.log('Cloud sync completed successfully:', {
+        sessions: mergedSessions.length,
+        scores: mergedScores.length,
+        subjects: mergedSubjects.length,
+        plans: mergedPlans.length,
+      });
+      
+      // Update state with merged data
+      setStudySessions(mergedSessions);
+      setTestScores(mergedScores);
+      setSubjects(mergedSubjects);
+      setStudyPlans(mergedPlans);
+      setExamDates(mergedDates);
+      
+    } catch (error) {
+      console.error('Error syncing with cloud:', error);
+      // Don't throw - just log the error and continue
+    }
+  }, [backupToiCloud]);
+
+  // Debug function to check stored data
+  const debugStoredData = useCallback(async () => {
+    try {
+      const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+      console.log('=== DEBUG STORED DATA ===');
+      console.log('Current user:', currentUser?.id || 'guest');
+      console.log('Current state counts:', {
+        sessions: studySessions.length,
+        scores: testScores.length,
+        subjects: subjects.length,
+        plans: studyPlans.length,
+        isLoading
+      });
+      
+      const [sessions, scores, subjectsData, plans, active, dates] = await Promise.all([
+        AsyncStorage.getItem(STORAGE_KEYS.STUDY_SESSIONS),
+        AsyncStorage.getItem(STORAGE_KEYS.TEST_SCORES),
+        AsyncStorage.getItem(STORAGE_KEYS.SUBJECTS),
+        AsyncStorage.getItem(STORAGE_KEYS.STUDY_PLANS),
+        AsyncStorage.getItem(STORAGE_KEYS.ACTIVE_SESSION),
+        AsyncStorage.getItem(STORAGE_KEYS.EXAM_DATES),
+      ]);
+      
+      console.log('Raw sessions data:', sessions?.substring(0, 200));
+      console.log('Raw scores data:', scores?.substring(0, 200));
+      console.log('Raw subjects data:', subjectsData?.substring(0, 200));
+      
+      const parsedSessions = safeJsonParse(sessions, []);
+      const parsedScores = safeJsonParse(scores, []);
+      const parsedSubjects = safeJsonParse(subjectsData, []);
+      
+      console.log('Parsed sessions count:', parsedSessions.length);
+      console.log('Parsed scores count:', parsedScores.length);
+      console.log('Parsed subjects count:', parsedSubjects.length);
+      
+      if (parsedSessions.length > 0) {
+        console.log('Sample session:', parsedSessions[0]);
+        console.log('All session dates:', parsedSessions.map((s: any) => ({ id: s.id, date: s.date, startTime: s.startTime })));
+      }
+      
+      if (parsedSubjects.length > 0) {
+        console.log('Sample subject:', parsedSubjects[0]);
+      }
+      
+      // Check all storage keys
+      const allKeys = await AsyncStorage.getAllKeys();
+      const studyRelatedKeys = allKeys.filter(key => 
+        key.includes('study') || key.includes('session') || key.includes('subject') || key.includes('score')
+      );
+      console.log('All study-related keys in storage:', studyRelatedKeys);
+      
+      console.log('=== END DEBUG ===');
+    } catch (error) {
+      console.error('Error debugging stored data:', error);
+    }
+  }, [currentUser?.id, studySessions.length, testScores.length, subjects.length, studyPlans.length, isLoading]);
+
+  // Load current user and initialize data
+  useEffect(() => {
+    // Initialize app without clearing data first
+    const initializeApp = async () => {
+      try {
+        console.log('Initializing app - loading user...');
+        // First, clean up any corrupted data
+        await clearCorruptedData();
+        // Then load the current user
+        await loadCurrentUser();
+      } catch (error) {
+        console.error('Error during app initialization:', error);
+        // Fallback to just loading user
+        await loadCurrentUser();
+      }
+    };
+    
+    initializeApp();
+  }, [loadCurrentUser, clearCorruptedData]);
+
+  // Set up an interval to check for user changes (for login/logout detection)
+  useEffect(() => {
+    let isActive = true;
+    
+    const checkUserStatus = async () => {
+      if (!isActive) return;
+      
+      try {
+        const userData = await AsyncStorage.getItem('user_data');
+        const parsedUser = safeJsonParse(userData, null);
+        
+        // Check for logout
+        if (!parsedUser && currentUser !== null && currentUser !== undefined) {
+          // User data was cleared (logout) but we still have a user in state
+          console.log('Detected logout - clearing study data');
+          if (isActive) {
+            setStudySessions([]);
+            setTestScores([]);
+            setSubjects([]);
+            setStudyPlans([]);
+            setActiveSession(null);
+            setExamDates({ NEET_PG: '', INICET: '' });
+            setCurrentUser(null);
+          }
+        }
+        // Check for login
+        else if (parsedUser && parsedUser.id && (!currentUser || currentUser.id !== parsedUser.id)) {
+          // New user logged in
+          console.log('Detected login - loading user data for:', parsedUser.email);
+          if (isActive) {
+            setCurrentUser(parsedUser);
+          }
+        }
+      } catch (error) {
+        console.error('Error checking user status:', error);
+      }
+    };
+    
+    const interval = setInterval(checkUserStatus, 2000); // Check every 2 seconds instead of 1
+    
+    return () => {
+      isActive = false;
+      clearInterval(interval);
+    };
+  }, [currentUser]);
+
+  // Load data when user changes
+  useEffect(() => {
+    let isActive = true;
+    
+    const handleUserChange = async () => {
+      if (currentUser !== undefined && isActive) { // undefined means we haven't loaded user yet, null means no user
+        console.log('handleUserChange - User state changed:', currentUser?.id || 'guest');
+        if (currentUser === null) {
+          // User logged out - ensure data is cleared
+          console.log('handleUserChange - Clearing data for logged out user');
+          setStudySessions([]);
+          setTestScores([]);
+          setSubjects([]);
+          setStudyPlans([]);
+          setActiveSession(null);
+          setExamDates({ NEET_PG: '', INICET: '' });
+          setIsLoading(false);
+        } else {
+          // User exists (logged in or guest) - load their data
+          console.log('handleUserChange - Loading data for user:', currentUser?.id || 'guest');
+          await loadData();
+        }
+      }
+    };
+    
+    handleUserChange();
+    
+    return () => {
+      isActive = false;
+    };
+  }, [currentUser, loadData]);
+
+  // Initialize default subjects if none exist after data load
+  useEffect(() => {
+    let isActive = true;
+    
+    const initializeDefaultSubjects = async () => {
+      if (!isActive) return;
+      
+      // Wait a bit longer to ensure data loading is complete
+      if (!isLoading && currentUser !== undefined && subjects.length === 0) {
+        console.log('No subjects found, initializing default subjects for user:', currentUser?.id || 'guest');
+        
+        // Import default subjects
+        const { DEFAULT_SUBJECTS } = await import('@/constants/subjects');
+        
+        if (isActive) {
+          console.log('Setting default subjects:', DEFAULT_SUBJECTS.length);
+          setSubjects(DEFAULT_SUBJECTS);
+          
+          // Save to storage
+          const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+          try {
+            await AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(DEFAULT_SUBJECTS));
+            console.log('Default subjects saved to storage');
+          } catch (error) {
+            console.error('Error saving default subjects:', error);
+          }
+        }
+      }
+    };
+    
+    // Add a small delay to ensure all data loading is complete
+    const timer = setTimeout(initializeDefaultSubjects, 500);
+    
+    return () => {
+      isActive = false;
+      clearTimeout(timer);
+    };
+  }, [isLoading, currentUser, subjects.length]);
+
+  // Auto-sync for authenticated users when app comes to foreground
+  useEffect(() => {
+    const handleAppStateChange = async (nextAppState: string) => {
+      if (!currentUser?.id) {
+        return;
+      }
+      
+      if (nextAppState === 'active') {
+        console.log('App became active, syncing user data for:', currentUser.email);
+        await syncWithCloud(currentUser.id);
+        // Don't reload data after sync - syncWithCloud already updates state
+      }
+    };
+
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    return () => subscription?.remove();
+  }, [currentUser, syncWithCloud]);
+
+  const startStudySession = useCallback(async (subjectId: string) => {
+    const session = {
+      subjectId,
+      startTime: new Date().toISOString(),
+      pausedTime: 0,
+      isPaused: false,
+    };
+    setActiveSession(session);
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    await AsyncStorage.setItem(STORAGE_KEYS.ACTIVE_SESSION, JSON.stringify(session));
+  }, [currentUser?.id]);
+
+  const pauseStudySession = useCallback(async () => {
+    if (!activeSession || activeSession.isPaused) return;
+    
+    const updatedSession = {
+      ...activeSession,
+      isPaused: true,
+      lastPauseStart: new Date().toISOString(),
+    };
+    
+    setActiveSession(updatedSession);
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    await AsyncStorage.setItem(STORAGE_KEYS.ACTIVE_SESSION, JSON.stringify(updatedSession));
+  }, [activeSession, currentUser?.id]);
+
+  const resumeStudySession = useCallback(async () => {
+    if (!activeSession || !activeSession.isPaused || !activeSession.lastPauseStart) return;
+    
+    const pauseDuration = new Date().getTime() - new Date(activeSession.lastPauseStart).getTime();
+    const updatedSession = {
+      ...activeSession,
+      isPaused: false,
+      pausedTime: (activeSession.pausedTime || 0) + pauseDuration,
+      lastPauseStart: undefined,
+    };
+    
+    setActiveSession(updatedSession);
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    await AsyncStorage.setItem(STORAGE_KEYS.ACTIVE_SESSION, JSON.stringify(updatedSession));
+  }, [activeSession, currentUser?.id]);
+
+  const endStudySession = useCallback(async (notes?: string) => {
+    if (!activeSession) return null;
+
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    const endTime = new Date();
+    const startTime = new Date(activeSession.startTime);
+    
+    // Calculate total paused time
+    let totalPausedTime = activeSession.pausedTime || 0;
+    
+    // If currently paused, add the current pause duration
+    if (activeSession.isPaused && activeSession.lastPauseStart) {
+      const currentPauseDuration = endTime.getTime() - new Date(activeSession.lastPauseStart).getTime();
+      totalPausedTime += currentPauseDuration;
+    }
+    
+    // Calculate actual study duration (excluding paused time)
+    const totalElapsed = endTime.getTime() - startTime.getTime();
+    const actualStudyTime = totalElapsed - totalPausedTime;
+    const duration = Math.max(1, Math.round(actualStudyTime / 60000)); // minutes, minimum 1
+
+    // IMPORTANT: Only save work sessions, never breaks
+    // Check if notes indicate this is a break (should never happen)
+    if (notes && (notes.toLowerCase().includes('break') || notes.toLowerCase().includes('rest'))) {
+      console.error('WARNING: Attempted to save a break session to history, blocking!', notes);
+      setActiveSession(null);
+      await AsyncStorage.removeItem(STORAGE_KEYS.ACTIVE_SESSION);
+      return null;
+    }
+
+    // Find the subject to get its name
+    const subject = subjects.find(s => s.id === activeSession.subjectId);
+    
+    const newSession: StudySession = {
+      id: Date.now().toString(),
+      subjectId: activeSession.subjectId,
+      subjectName: subject?.name, // Store subject name for historical accuracy
+      startTime: activeSession.startTime,
+      endTime: endTime.toISOString(),
+      duration,
+      date: startTime.toISOString().split('T')[0],
+      notes,
+    };
+
+    console.log('endStudySession - Creating new WORK session:', newSession);
+    
+    const updatedSessions = [...studySessions, newSession];
+    
+    // Update subject completed hours
+    const updatedSubjects = subjects.map(s => 
+      s.id === activeSession.subjectId 
+        ? { ...s, completedHours: s.completedHours + duration / 60 }
+        : s
+    );
+    
+    // Update state first
+    setStudySessions(updatedSessions);
+    setSubjects(updatedSubjects);
+    setActiveSession(null);
+    
+    // Then save to storage
+    const savePromises = [
+      AsyncStorage.setItem(STORAGE_KEYS.STUDY_SESSIONS, JSON.stringify(updatedSessions)),
+      AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(updatedSubjects)),
+      AsyncStorage.removeItem(STORAGE_KEYS.ACTIVE_SESSION),
+    ];
+    
+    // For authenticated users, also save to cloud storage and iCloud
+    if (currentUser?.id) {
+      savePromises.push(
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_STUDY_SESSIONS, JSON.stringify(updatedSessions)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_SUBJECTS, JSON.stringify(updatedSubjects)),
+        AsyncStorage.setItem(STORAGE_KEYS.LAST_CLOUD_SYNC, new Date().toISOString())
+      );
+      
+      // Backup to iCloud on iOS
+      if (Platform.OS === 'ios') {
+        try {
+          await backupToiCloud(updatedSessions, `${currentUser.id}_sessions`);
+          await backupToiCloud(updatedSubjects, `${currentUser.id}_subjects`);
+        } catch (error) {
+          console.warn('iCloud backup failed:', error);
+        }
+      }
+    }
+    
+    await Promise.all(savePromises);
+
+    return newSession;
+  }, [activeSession, studySessions, subjects, currentUser?.id, backupToiCloud]);
+
+  const addTestScore = useCallback(async (testScore: Omit<TestScore, 'id'>) => {
+    const newScore: TestScore = {
+      ...testScore,
+      id: Date.now().toString(),
+    };
+
+    const updatedScores = [...testScores, newScore];
+    setTestScores(updatedScores);
+    
+    // Update subject average marks and progress
+    const updatedSubjects = subjects.map(subject => {
+      const subjectTestScores = updatedScores
+        .map(test => test.subjectScores.find(s => s.subjectId === subject.id))
+        .filter(Boolean);
+      
+      if (subjectTestScores.length > 0) {
+        const averageMarks = subjectTestScores.reduce((sum, score) => sum + (score?.percentage || 0), 0) / subjectTestScores.length;
+        
+        // Calculate marks progress (0-100 scale)
+        // 90%+ = 100% progress, 80-89% = 90% progress, 70-79% = 80% progress, etc.
+        let marksProgress = 0;
+        if (averageMarks >= 90) marksProgress = 100;
+        else if (averageMarks >= 80) marksProgress = 90;
+        else if (averageMarks >= 70) marksProgress = 80;
+        else if (averageMarks >= 60) marksProgress = 70;
+        else if (averageMarks >= 50) marksProgress = 60;
+        else if (averageMarks >= 40) marksProgress = 50;
+        else if (averageMarks >= 30) marksProgress = 40;
+        else marksProgress = averageMarks;
+        
+        return {
+          ...subject,
+          averageMarks: Math.round(averageMarks * 10) / 10,
+          marksProgress: Math.round(marksProgress),
+        };
+      }
+      return subject;
+    });
+    
+    setSubjects(updatedSubjects);
+    
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    const savePromises = [
+      AsyncStorage.setItem(STORAGE_KEYS.TEST_SCORES, JSON.stringify(updatedScores)),
+      AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(updatedSubjects)),
+    ];
+    
+    // For authenticated users, also save to cloud storage and iCloud
+    if (currentUser?.id) {
+      savePromises.push(
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_TEST_SCORES, JSON.stringify(updatedScores)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_SUBJECTS, JSON.stringify(updatedSubjects)),
+        AsyncStorage.setItem(STORAGE_KEYS.LAST_CLOUD_SYNC, new Date().toISOString())
+      );
+      
+      // Backup to iCloud on iOS
+      if (Platform.OS === 'ios') {
+        try {
+          await backupToiCloud(updatedScores, `${currentUser.id}_scores`);
+          await backupToiCloud(updatedSubjects, `${currentUser.id}_subjects`);
+        } catch (error) {
+          console.warn('iCloud backup during test score add failed:', error);
+        }
+      }
+    }
+    
+    await Promise.all(savePromises);
+    
+    return newScore;
+  }, [testScores, subjects, currentUser?.id, backupToiCloud]);
+
+  const updateStudyPlan = useCallback(async (plan: StudyPlan) => {
+    const existingIndex = studyPlans.findIndex(p => p.subjectId === plan.subjectId);
+    let updatedPlans: StudyPlan[];
+    
+    if (existingIndex >= 0) {
+      updatedPlans = [...studyPlans];
+      updatedPlans[existingIndex] = plan;
+    } else {
+      updatedPlans = [...studyPlans, plan];
+    }
+
+    setStudyPlans(updatedPlans);
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    await AsyncStorage.setItem(STORAGE_KEYS.STUDY_PLANS, JSON.stringify(updatedPlans));
+  }, [studyPlans, currentUser?.id]);
+
+  const getTodayStats = useCallback((): DailyStats => {
+    // Use a stable date calculation to prevent flickering
+    const now = new Date();
+    // Get today's date in YYYY-MM-DD format in local timezone
+    const today = now.getFullYear() + '-' + 
+      String(now.getMonth() + 1).padStart(2, '0') + '-' + 
+      String(now.getDate()).padStart(2, '0');
+    
+    console.log('getTodayStats - Today date:', today);
+    console.log('getTodayStats - Total sessions:', studySessions.length);
+    
+    const todaySessions = studySessions.filter(s => {
+      if (!s || !s.startTime) {
+        console.log('getTodayStats - Invalid session:', s);
+        return false;
+      }
+      
+      // Get session date from either date field or startTime
+      let sessionDate = s.date;
+      if (!sessionDate) {
+        // Extract date from startTime ISO string
+        const startTimeDate = new Date(s.startTime);
+        sessionDate = startTimeDate.getFullYear() + '-' + 
+          String(startTimeDate.getMonth() + 1).padStart(2, '0') + '-' + 
+          String(startTimeDate.getDate()).padStart(2, '0');
+      }
+      
+      console.log('getTodayStats - Comparing session date:', sessionDate, 'with today:', today);
+      const isToday = sessionDate === today;
+      if (isToday) {
+        console.log('getTodayStats - Found today session:', {
+          sessionId: s.id,
+          subjectId: s.subjectId,
+          duration: s.duration,
+          startTime: s.startTime,
+          date: s.date
+        });
+      }
+      return isToday;
+    });
+    
+    console.log('getTodayStats - Today sessions found:', todaySessions.length);
+    
+    const subjectBreakdown = subjects.map(subject => {
+      const subjectSessions = todaySessions.filter(s => s.subjectId === subject.id);
+      const minutes = subjectSessions.reduce((sum, s) => sum + (s.duration || 0), 0);
+      if (minutes > 0) {
+        console.log('getTodayStats - Subject breakdown:', subject.name, minutes, 'minutes');
+      }
+      return { subjectId: subject.id, minutes };
+    }).filter(s => s.minutes > 0);
+
+    const totalMinutes = subjectBreakdown.reduce((sum, s) => sum + s.minutes, 0);
+    
+    console.log('getTodayStats - Final result:', { today, totalMinutes, subjectCount: subjectBreakdown.length });
+
+    return {
+      date: today,
+      totalMinutes,
+      subjectBreakdown,
+    };
+  }, [studySessions, subjects]);
+
+  const getWeeklyStats = useCallback(() => {
+    // Use stable date calculations to prevent flickering
+    const now = new Date();
+    
+    // Calculate week range using stable date strings
+    const dailyStats: DailyStats[] = [];
+    
+    for (let i = 6; i >= 0; i--) {
+      const date = new Date(now);
+      date.setDate(date.getDate() - i);
+      const dateStr = date.getFullYear() + '-' + 
+        String(date.getMonth() + 1).padStart(2, '0') + '-' + 
+        String(date.getDate()).padStart(2, '0');
+      
+      const daySessions = studySessions.filter(s => {
+        if (!s || !s.startTime) return false;
+        
+        let sessionDateStr = s.date;
+        if (!sessionDateStr) {
+          const sessionDate = new Date(s.startTime);
+          sessionDateStr = sessionDate.getFullYear() + '-' + 
+            String(sessionDate.getMonth() + 1).padStart(2, '0') + '-' + 
+            String(sessionDate.getDate()).padStart(2, '0');
+        }
+        
+        return sessionDateStr === dateStr;
+      });
+      
+      const subjectBreakdown = subjects.map(subject => {
+        const subjectSessions = daySessions.filter(s => s.subjectId === subject.id);
+        const minutes = subjectSessions.reduce((sum, s) => sum + (s.duration || 0), 0);
+        return { subjectId: subject.id, minutes };
+      }).filter(s => s.minutes > 0);
+
+      const dayTotalMinutes = subjectBreakdown.reduce((sum, s) => sum + s.minutes, 0);
+      
+      dailyStats.push({
+        date: dateStr,
+        totalMinutes: dayTotalMinutes,
+        subjectBreakdown,
+      });
+    }
+
+    return dailyStats;
+  }, [studySessions, subjects]);
+
+  const getSubjectPerformance = useCallback((subjectId: string) => {
+    const subjectTests = testScores.map(test => {
+      const subjectScore = test.subjectScores.find(s => s.subjectId === subjectId);
+      return {
+        date: test.date,
+        testName: test.testName,
+        testType: test.testType,
+        percentage: subjectScore?.percentage || 0,
+        correctAnswers: subjectScore?.correctAnswers || 0,
+        totalQuestions: subjectScore?.totalQuestions || 0,
+      };
+    }).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    return subjectTests;
+  }, [testScores]);
+
+  const deleteTestScore = useCallback(async (testId: string) => {
+    const updatedScores = testScores.filter(t => t.id !== testId);
+    setTestScores(updatedScores);
+    
+    // Recalculate subject average marks after deletion
+    const updatedSubjects = subjects.map(subject => {
+      const subjectTestScores = updatedScores
+        .map(test => test.subjectScores.find(s => s.subjectId === subject.id))
+        .filter(Boolean);
+      
+      if (subjectTestScores.length > 0) {
+        const averageMarks = subjectTestScores.reduce((sum, score) => sum + (score?.percentage || 0), 0) / subjectTestScores.length;
+        
+        let marksProgress = 0;
+        if (averageMarks >= 90) marksProgress = 100;
+        else if (averageMarks >= 80) marksProgress = 90;
+        else if (averageMarks >= 70) marksProgress = 80;
+        else if (averageMarks >= 60) marksProgress = 70;
+        else if (averageMarks >= 50) marksProgress = 60;
+        else if (averageMarks >= 40) marksProgress = 50;
+        else if (averageMarks >= 30) marksProgress = 40;
+        else marksProgress = averageMarks;
+        
+        return {
+          ...subject,
+          averageMarks: Math.round(averageMarks * 10) / 10,
+          marksProgress: Math.round(marksProgress),
+        };
+      }
+      return {
+        ...subject,
+        averageMarks: undefined,
+        marksProgress: undefined,
+      };
+    });
+    
+    setSubjects(updatedSubjects);
+    
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    await Promise.all([
+      AsyncStorage.setItem(STORAGE_KEYS.TEST_SCORES, JSON.stringify(updatedScores)),
+      AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(updatedSubjects)),
+    ]);
+  }, [testScores, subjects, currentUser?.id]);
+
+  const updateExamDates = useCallback(async (dates: { NEET_PG: string; INICET: string }) => {
+    setExamDates(dates);
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    const savePromises = [
+      AsyncStorage.setItem(STORAGE_KEYS.EXAM_DATES, JSON.stringify(dates))
+    ];
+    
+    // For authenticated users, also save to cloud storage and iCloud
+    if (currentUser?.id) {
+      savePromises.push(
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_EXAM_DATES, JSON.stringify(dates)),
+        AsyncStorage.setItem(STORAGE_KEYS.LAST_CLOUD_SYNC, new Date().toISOString())
+      );
+      
+      // Backup to iCloud on iOS
+      if (Platform.OS === 'ios') {
+        try {
+          await backupToiCloud(dates, `${currentUser.id}_dates`);
+        } catch (error) {
+          console.warn('iCloud backup during exam dates update failed:', error);
+        }
+      }
+    }
+    
+    await Promise.all(savePromises);
+  }, [currentUser?.id, backupToiCloud]);
+
+  const clearAllData = useCallback(async () => {
+    try {
+      const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+      // Clear all storage keys
+      await Promise.all([
+        AsyncStorage.removeItem(STORAGE_KEYS.STUDY_SESSIONS),
+        AsyncStorage.removeItem(STORAGE_KEYS.TEST_SCORES),
+        AsyncStorage.removeItem(STORAGE_KEYS.SUBJECTS),
+        AsyncStorage.removeItem(STORAGE_KEYS.STUDY_PLANS),
+        AsyncStorage.removeItem(STORAGE_KEYS.ACTIVE_SESSION),
+        AsyncStorage.removeItem(STORAGE_KEYS.EXAM_DATES),
+      ]);
+      
+      // Reset all state to empty
+      setStudySessions([]);
+      setTestScores([]);
+      setStudyPlans([]);
+      setActiveSession(null);
+      setExamDates({ NEET_PG: '', INICET: '' });
+      setSubjects([]);
+      
+      console.log('All data cleared and reset successfully');
+    } catch (error) {
+      console.error('Error clearing all data:', error);
+    }
+  }, [currentUser?.id]);
+
+  const forceResetStorage = useCallback(async () => {
+    try {
+      const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+      // Get all keys and clear everything
+      const allKeys = await AsyncStorage.getAllKeys();
+      const studyKeys = allKeys.filter(key => 
+        Object.values(STORAGE_KEYS).includes(key as any)
+      );
+      
+      if (studyKeys.length > 0) {
+        await AsyncStorage.multiRemove(studyKeys);
+        console.log('Force cleared storage keys:', studyKeys);
+      }
+      
+      // Reload data from scratch
+      await loadData();
+    } catch (error) {
+      console.error('Error force resetting storage:', error);
+    }
+  }, [currentUser?.id, loadData]);
+
+  const deleteSession = useCallback(async (sessionId: string) => {
+    const updatedSessions = studySessions.filter(s => s.id !== sessionId);
+    setStudySessions(updatedSessions);
+    
+    // Recalculate subject completed hours
+    const updatedSubjects = subjects.map(subject => {
+      const subjectSessions = updatedSessions.filter(s => s.subjectId === subject.id);
+      const completedMinutes = subjectSessions.reduce((sum, s) => sum + s.duration, 0);
+      return {
+        ...subject,
+        completedHours: completedMinutes / 60,
+      };
+    });
+    setSubjects(updatedSubjects);
+    
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    const savePromises = [
+      AsyncStorage.setItem(STORAGE_KEYS.STUDY_SESSIONS, JSON.stringify(updatedSessions)),
+      AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(updatedSubjects)),
+    ];
+    
+    // For authenticated users, also save to cloud storage and iCloud
+    if (currentUser?.id) {
+      savePromises.push(
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_STUDY_SESSIONS, JSON.stringify(updatedSessions)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_SUBJECTS, JSON.stringify(updatedSubjects)),
+        AsyncStorage.setItem(STORAGE_KEYS.LAST_CLOUD_SYNC, new Date().toISOString())
+      );
+      
+      // Backup to iCloud on iOS
+      if (Platform.OS === 'ios') {
+        try {
+          await backupToiCloud(updatedSessions, `${currentUser.id}_sessions`);
+          await backupToiCloud(updatedSubjects, `${currentUser.id}_subjects`);
+        } catch (error) {
+          console.warn('iCloud backup failed:', error);
+        }
+      }
+    }
+    
+    await Promise.all(savePromises);
+  }, [studySessions, subjects, currentUser?.id, backupToiCloud]);
+
+  const deleteSessions = useCallback(async (sessionIds: string[]) => {
+    const updatedSessions = studySessions.filter(s => !sessionIds.includes(s.id));
+    setStudySessions(updatedSessions);
+    
+    // Recalculate subject completed hours
+    const updatedSubjects = subjects.map(subject => {
+      const subjectSessions = updatedSessions.filter(s => s.subjectId === subject.id);
+      const completedMinutes = subjectSessions.reduce((sum, s) => sum + s.duration, 0);
+      return {
+        ...subject,
+        completedHours: completedMinutes / 60,
+      };
+    });
+    setSubjects(updatedSubjects);
+    
+    const STORAGE_KEYS = getStorageKeys(currentUser?.id);
+    const savePromises = [
+      AsyncStorage.setItem(STORAGE_KEYS.STUDY_SESSIONS, JSON.stringify(updatedSessions)),
+      AsyncStorage.setItem(STORAGE_KEYS.SUBJECTS, JSON.stringify(updatedSubjects)),
+    ];
+    
+    // For authenticated users, also save to cloud storage and iCloud
+    if (currentUser?.id) {
+      savePromises.push(
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_STUDY_SESSIONS, JSON.stringify(updatedSessions)),
+        AsyncStorage.setItem(STORAGE_KEYS.CLOUD_SUBJECTS, JSON.stringify(updatedSubjects)),
+        AsyncStorage.setItem(STORAGE_KEYS.LAST_CLOUD_SYNC, new Date().toISOString())
+      );
+      
+      // Backup to iCloud on iOS
+      if (Platform.OS === 'ios') {
+        try {
+          await backupToiCloud(updatedSessions, `${currentUser.id}_sessions`);
+          await backupToiCloud(updatedSubjects, `${currentUser.id}_subjects`);
+        } catch (error) {
+          console.warn('iCloud backup failed:', error);
+        }
+      }
+    }
+    
+    await Promise.all(savePromises);
+  }, [studySessions, subjects, currentUser?.id, backupToiCloud]);
+
+  const getOverallProgress = useCallback((subjectId: string) => {
+    const subject = subjects.find(s => s.id === subjectId);
+    if (!subject) return { hoursProgress: 0, marksProgress: 0, overallProgress: 0 };
+    
+    const hoursProgress = Math.min(100, Math.round((subject.completedHours / subject.targetHours) * 100));
+    const marksProgress = subject.marksProgress || 0;
+    
+    // Overall progress is weighted average: 40% hours, 60% marks
+    const overallProgress = marksProgress > 0 
+      ? Math.round(hoursProgress * 0.4 + marksProgress * 0.6)
+      : hoursProgress;
+    
+    return {
+      hoursProgress,
+      marksProgress,
+      overallProgress,
+    };
+  }, [subjects]);
+
+  // Migration function to move guest data to user account
+  const migrateGuestDataToUser = useCallback(async (userId: string) => {
+    try {
+      console.log('Migrating guest data to user account:', userId);
+      
+      const guestKeys = getStorageKeys();
+      const userKeys = getStorageKeys(userId);
+      
+      // Check if user already has data
+      const existingUserData = await AsyncStorage.getItem(userKeys.STUDY_SESSIONS);
+      const existingCloudData = await AsyncStorage.getItem(userKeys.CLOUD_STUDY_SESSIONS);
+      
+      if ((existingUserData && existingUserData !== '[]' && existingUserData !== 'null') || 
+          (existingCloudData && existingCloudData !== '[]' && existingCloudData !== 'null')) {
+        console.log('User already has data, skipping migration');
+        return;
+      }
+      
+      // Get all guest data
+      const [guestSessions, guestScores, guestSubjects, guestPlans, guestActive, guestDates] = await Promise.all([
+        AsyncStorage.getItem(guestKeys.STUDY_SESSIONS),
+        AsyncStorage.getItem(guestKeys.TEST_SCORES),
+        AsyncStorage.getItem(guestKeys.SUBJECTS),
+        AsyncStorage.getItem(guestKeys.STUDY_PLANS),
+        AsyncStorage.getItem(guestKeys.ACTIVE_SESSION),
+        AsyncStorage.getItem(guestKeys.EXAM_DATES),
+      ]);
+      
+      // Migrate data if it exists
+      const migrationPromises = [];
+      
+      if (guestSessions && guestSessions !== '[]' && guestSessions !== 'null') {
+        migrationPromises.push(AsyncStorage.setItem(userKeys.STUDY_SESSIONS, guestSessions));
+        migrationPromises.push(AsyncStorage.setItem(userKeys.CLOUD_STUDY_SESSIONS, guestSessions));
+      }
+      if (guestScores && guestScores !== '[]' && guestScores !== 'null') {
+        migrationPromises.push(AsyncStorage.setItem(userKeys.TEST_SCORES, guestScores));
+        migrationPromises.push(AsyncStorage.setItem(userKeys.CLOUD_TEST_SCORES, guestScores));
+      }
+      if (guestSubjects && guestSubjects !== 'null') {
+        migrationPromises.push(AsyncStorage.setItem(userKeys.SUBJECTS, guestSubjects));
+        migrationPromises.push(AsyncStorage.setItem(userKeys.CLOUD_SUBJECTS, guestSubjects));
+      }
+      if (guestPlans && guestPlans !== '[]' && guestPlans !== 'null') {
+        migrationPromises.push(AsyncStorage.setItem(userKeys.STUDY_PLANS, guestPlans));
+        migrationPromises.push(AsyncStorage.setItem(userKeys.CLOUD_STUDY_PLANS, guestPlans));
+      }
+      if (guestActive && guestActive !== 'null') {
+        migrationPromises.push(AsyncStorage.setItem(userKeys.ACTIVE_SESSION, guestActive));
+      }
+      if (guestDates && guestDates !== 'null') {
+        migrationPromises.push(AsyncStorage.setItem(userKeys.EXAM_DATES, guestDates));
+        migrationPromises.push(AsyncStorage.setItem(userKeys.CLOUD_EXAM_DATES, guestDates));
+      }
+      
+      if (migrationPromises.length > 0) {
+        await Promise.all(migrationPromises);
+        console.log('Successfully migrated guest data to user account');
+        
+        // Don't clean up guest data immediately - keep it as backup for now
+        console.log('Guest data kept as backup');
+      }
+    } catch (error) {
+      console.error('Error migrating guest data:', error);
+    }
+  }, []);
+
+  // Handle user login - migrate data and reload
+  const handleUserLogin = useCallback(async (user: User) => {
+    console.log('Handling user login:', user.email);
+    
+    // Only proceed if user is different
+    if (currentUser && currentUser.id === user.id) {
+      console.log('Same user already logged in, skipping');
+      return;
+    }
+    
+    try {
+      // Set loading state
+      setIsLoading(true);
+      
+      // Migrate guest data to user account if needed
+      await migrateGuestDataToUser(user.id);
+      
+      // Update current user - this will trigger data reload via useEffect
+      setCurrentUser(user);
+      
+      // For authenticated users, sync with cloud after setting user
+      if (user.id) {
+        setTimeout(async () => {
+          try {
+            await syncWithCloud(user.id);
+          } catch (error) {
+            console.error('Error syncing with cloud after login:', error);
+          }
+        }, 1000); // Increased timeout to allow data loading to complete
+      }
+    } catch (error) {
+      console.error('Error handling user login:', error);
+    }
+  }, [currentUser, migrateGuestDataToUser, syncWithCloud]);
+
+  // Handle user logout
+  const handleUserLogout = useCallback(async () => {
+    console.log('Handling user logout');
+    
+    // Clear all data immediately when logging out
+    setStudySessions([]);
+    setTestScores([]);
+    setSubjects([]);
+    setStudyPlans([]);
+    setActiveSession(null);
+    setExamDates({ NEET_PG: '', INICET: '' });
+    
+    // Set user to null after clearing data
+    setCurrentUser(null);
+  }, []);
+
+  // Refresh data function for pull-to-refresh
+  const refreshData = useCallback(async () => {
+    console.log('Refreshing data...');
+    try {
+      setIsLoading(true);
+      
+      // If user is authenticated, sync with cloud
+      if (currentUser && currentUser.id) {
+        await syncWithCloud(currentUser.id);
+      } else {
+        // For non-authenticated users, just reload from storage
+        await loadData();
+      }
+      
+      console.log('Data refresh completed');
+    } catch (error) {
+      console.error('Error refreshing data:', error);
+      // Try to reload data even if sync failed
+      await loadData();
+    } finally {
+      setIsLoading(false);
+    }
+  }, [loadData, currentUser, syncWithCloud]);
+
+  // Emergency data recovery function
+  const emergencyDataRecovery = useCallback(async () => {
+    try {
+      console.log('Starting emergency data recovery...');
+      
+      // Import and use the data recovery service
+      const { DataRecoveryService } = await import('@/utils/data-recovery');
+      const result = await DataRecoveryService.recoverAllData(currentUser?.id);
+      
+      if (result.success) {
+        console.log('Emergency recovery successful:', result.recoveredData);
+        
+        // Update state with recovered data
+        setStudySessions(result.recoveredData.sessions);
+        setTestScores(result.recoveredData.scores);
+        setSubjects(result.recoveredData.subjects);
+        setStudyPlans(result.recoveredData.plans);
+        setExamDates(result.recoveredData.examDates);
+        
+        // Save recovered data to proper storage keys
+        await DataRecoveryService.saveRecoveredData(result.recoveredData, currentUser?.id);
+        
+        return {
+          success: true,
+          message: `Recovered ${result.recoveredData.sessions.length} sessions, ${result.recoveredData.scores.length} test scores, and ${result.recoveredData.subjects.length} subjects.`,
+          data: result.recoveredData
+        };
+      } else {
+        return {
+          success: false,
+          message: 'No recoverable data found.',
+          errors: result.errors
+        };
+      }
+    } catch (error) {
+      console.error('Emergency recovery failed:', error);
+      return {
+        success: false,
+        message: 'Emergency recovery failed.',
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }, [currentUser?.id]);
+
+  // Return the context value
+  return {
+    studySessions,
+    sessions: studySessions, // Alias for compatibility
+    testScores,
+    subjects,
+    studyPlans,
+    activeSession,
+    examDates,
+    isLoading,
+    currentUser,
+    startStudySession,
+    pauseStudySession,
+    resumeStudySession,
+    endStudySession,
+    addTestScore,
+    updateStudyPlan,
+    updateExamDates,
+    getTodayStats,
+    getWeeklyStats,
+    getSubjectPerformance,
+    getOverallProgress,
+    deleteTestScore,
+    deleteSession,
+    deleteSessions,
+    clearAllData,
+    forceResetStorage,
+    migrateGuestDataToUser,
+    syncWithCloud,
+    refreshData,
+    clearCorruptedData,
+    handleUserLogin,
+    handleUserLogout,
+    backupToiCloud,
+    restoreFromiCloud,
+    forceRestoreFromiCloud,
+    debugStoredData,
+    createDataBackup,
+    emergencyDataRecovery,
+  };
+});

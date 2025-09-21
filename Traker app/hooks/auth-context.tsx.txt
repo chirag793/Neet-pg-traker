@@ -1,0 +1,295 @@
+import createContextHook from '@nkzw/create-context-hook';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useEffect, useState, useCallback, useMemo } from 'react';
+import { Platform, Alert } from 'react-native';
+import { User } from '@/types/study';
+import * as AppleAuthentication from 'expo-apple-authentication';
+import { APPLE_AUTH_CONFIG } from '@/constants/auth-config';
+
+const STORAGE_KEYS = {
+  USER: 'user_data',
+  AUTH_TOKEN: 'auth_token',
+};
+
+export const [AuthProvider, useAuth] = createContextHook(() => {
+  const [user, setUser] = useState<User | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isLocalUser, setIsLocalUser] = useState(false);
+
+  const safeJsonParse = (data: string | null | undefined, fallback: any = null) => {
+    if (!data || data === 'undefined' || data === 'null') return fallback;
+    
+    try {
+      const dataStr = typeof data === 'string' ? data : String(data);
+      const trimmed = dataStr.trim();
+      
+      if (trimmed === '') return fallback;
+      
+      // Enhanced corruption detection patterns
+      const corruptionPatterns = [
+        /^object$/i,                    // Just "object"
+        /^object\s/i,                  // "object " (with space)
+        /^object Object$/i,            // "object Object"
+        /^\[object Object\]$/i,       // "[object Object]"
+        /^\[object\s+\w+\]$/i,         // "[object Something]"
+        /^NaN$/i,                      // "NaN"
+        /^undefined$/i,                // "undefined"
+        /^function/i,                  // Function strings
+        /^\w+\s+object/i,              // "something object"
+        /object\s*Object/i,            // Various "object Object" patterns
+        /^[a-zA-Z]+\s+[a-zA-Z]+$/,     // Two words (likely corrupted)
+      ];
+      
+      const isCorrupted = corruptionPatterns.some(pattern => pattern.test(trimmed));
+      
+      if (isCorrupted) {
+        console.warn('Detected corrupted user data, returning fallback:', trimmed.substring(0, 50));
+        return fallback;
+      }
+      
+      // Check if it looks like valid JSON structure
+      const startsWithValidJson = trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"');
+      const isValidPrimitive = ['true', 'false', 'null'].includes(trimmed.toLowerCase()) || /^-?\d*\.?\d+$/.test(trimmed);
+      
+      if (!startsWithValidJson && !isValidPrimitive) {
+        console.warn('User data does not look like valid JSON, returning fallback:', trimmed.substring(0, 50));
+        return fallback;
+      }
+      
+      // Try to parse JSON with enhanced error handling
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (parseError) {
+        // Log the specific error for debugging
+        if (typeof parseError === 'object' && parseError !== null && 'message' in parseError) {
+          const errorMessage = (parseError as Error).message;
+          console.warn('JSON parse error in auth context:', errorMessage, 'Data preview:', trimmed.substring(0, 100));
+          
+          // Return fallback for any JSON syntax errors - be more aggressive
+          console.warn('Returning fallback due to JSON parse error in auth');
+          return fallback;
+        }
+        console.warn('Unknown parse error in auth, returning fallback');
+        return fallback;
+      }
+      
+      if (parsed === null || parsed === undefined) {
+        return fallback;
+      }
+      
+      return parsed;
+    } catch (error) {
+      console.warn('Critical error in auth safeJsonParse, returning fallback. Error:', error, 'Data preview:', data?.toString().substring(0, 50));
+      return fallback;
+    }
+  };
+
+  const loadUserData = async () => {
+    try {
+      const userData = await AsyncStorage.getItem(STORAGE_KEYS.USER);
+      const parsedUser = safeJsonParse(userData, null);
+      
+      // Validate that the parsed data has required fields
+      if (parsedUser && typeof parsedUser === 'object' && parsedUser.id && parsedUser.email) {
+        console.log('User loaded successfully:', parsedUser.email);
+        setUser(parsedUser);
+      } else if (userData) {
+        // Invalid user data structure, clear it
+        console.warn('Invalid user data structure, clearing');
+        await AsyncStorage.removeItem(STORAGE_KEYS.USER);
+        await AsyncStorage.removeItem(STORAGE_KEYS.AUTH_TOKEN);
+      }
+    } catch (error) {
+      console.error('Error loading user data, clearing storage');
+      // Clear potentially corrupted data
+      try {
+        await AsyncStorage.removeItem(STORAGE_KEYS.USER);
+        await AsyncStorage.removeItem(STORAGE_KEYS.AUTH_TOKEN);
+      } catch (clearError) {
+        console.error('Error clearing data:', clearError);
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+  
+  const createLocalUser = useCallback(async (name?: string, email?: string) => {
+    try {
+      setIsLoading(true);
+      
+      // Generate a unique local user ID
+      const localUserId = `local_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      const newUser: User = {
+        id: localUserId,
+        email: email || 'local@device.storage',
+        name: name || 'Local User',
+        photoUrl: undefined,
+        createdAt: new Date().toISOString(),
+        lastSyncedAt: new Date().toISOString(),
+      };
+      
+      // Save user data to both keys for compatibility
+      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(newUser));
+      await AsyncStorage.setItem('user_data', JSON.stringify(newUser)); // For study context compatibility
+      await AsyncStorage.setItem(STORAGE_KEYS.AUTH_TOKEN, `local_token_${localUserId}`);
+      
+      setUser(newUser);
+      setIsLocalUser(true);
+      
+      return { type: 'success' };
+    } catch (error) {
+      console.error('Error creating local user:', error);
+      Alert.alert('Error', 'Failed to create local user. Please try again.');
+      return { type: 'error', error: 'Failed to create local user' };
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  // Load user data on mount
+  useEffect(() => {
+    loadUserData().then(() => {
+      // Check if user is a local user
+      AsyncStorage.getItem(STORAGE_KEYS.USER).then(userData => {
+        const parsedUser = safeJsonParse(userData, null);
+        if (parsedUser && parsedUser.id && parsedUser.id.startsWith('local_')) {
+          setIsLocalUser(true);
+        }
+      });
+    });
+  }, []);
+
+
+
+  const signInLocally = useCallback(async (name?: string, email?: string) => {
+    return await createLocalUser(name, email);
+  }, [createLocalUser]);
+
+  const signOut = useCallback(async () => {
+    try {
+      // Clear user data from storage first
+      await AsyncStorage.multiRemove([STORAGE_KEYS.USER, STORAGE_KEYS.AUTH_TOKEN]);
+      
+      // Also clear the user_data key to ensure study context detects logout
+      await AsyncStorage.removeItem('user_data');
+      
+      // Set user to null
+      setUser(null);
+      
+      // Reset local user flag
+      setIsLocalUser(false);
+    } catch (error) {
+      console.error('Error signing out:', error);
+    }
+  }, []);
+
+  const syncDataWithBackend = useCallback(async (userId: string, token: string) => {
+    if (!userId || !token || !token.trim()) {
+      throw new Error('Invalid user ID or token');
+    }
+    
+    try {
+      setIsSyncing(true);
+      
+      // Get all local data for future backend sync
+      // Currently storing locally only
+      // When backend is enabled, implement sync logic here
+      
+      // Update last synced time
+      const updatedUser = { ...user!, lastSyncedAt: new Date().toISOString() };
+      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
+      await AsyncStorage.setItem('user_data', JSON.stringify(updatedUser)); // For study context compatibility
+      setUser(updatedUser);
+      
+    } catch (error) {
+      console.error('Error syncing data:', error);
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [user]);
+
+  const syncData = useCallback(async () => {
+    if (!user) return;
+    
+    const token = await AsyncStorage.getItem(STORAGE_KEYS.AUTH_TOKEN);
+    if (token) {
+      await syncDataWithBackend(user.id, token);
+    }
+  }, [user, syncDataWithBackend]);
+
+  const signInWithApple = useCallback(async () => {
+    try {
+      // Check if we're on iOS and Apple Authentication is available
+      if (Platform.OS === 'ios') {
+        const isAvailable = await AppleAuthentication.isAvailableAsync();
+        if (isAvailable) {
+          setIsLoading(true);
+          
+          const credential = await AppleAuthentication.signInAsync({
+            requestedScopes: [
+              AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+              AppleAuthentication.AppleAuthenticationScope.EMAIL,
+            ],
+          });
+
+          if (credential.user) {
+            const newUser: User = {
+              id: credential.user,
+              email: credential.email || `${credential.user}@privaterelay.appleid.com`,
+              name: credential.fullName 
+                ? `${credential.fullName.givenName || ''} ${credential.fullName.familyName || ''}`.trim() 
+                : 'Apple User',
+              photoUrl: undefined, // Apple doesn't provide profile photos
+              createdAt: new Date().toISOString(),
+              lastSyncedAt: new Date().toISOString(),
+            };
+
+            // Save user data to both keys for compatibility
+            await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(newUser));
+            await AsyncStorage.setItem('user_data', JSON.stringify(newUser)); // For study context compatibility
+            await AsyncStorage.setItem(STORAGE_KEYS.AUTH_TOKEN, `apple_token_${credential.user}`);
+            
+            setUser(newUser);
+            
+            // Study context integration handled in _layout.tsx
+            
+            return { type: 'success' };
+          } else {
+            return { type: 'error' as const, error: 'No user data received from Apple' };
+          }
+        }
+      }
+      
+      // Apple Sign-In not available on this platform
+      return { type: 'error' as const, error: 'Apple Sign-In is only available on iOS devices' };
+    } catch (error: any) {
+      console.error('Apple sign in error:', error);
+      
+      if (error.code === 'ERR_REQUEST_CANCELED') {
+        return { type: 'cancel' };
+      }
+      
+      return { type: 'error' as const, error: error.message || 'Apple Sign-In failed' };
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  const contextValue = useMemo(() => ({
+    user,
+    isLoading,
+    isSyncing,
+    isLocalUser,
+    signInLocally,
+    signInWithApple,
+    signOut,
+    syncData,
+    isAuthenticated: !!user,
+    isAppleSignInAvailable: APPLE_AUTH_CONFIG.enabled && Platform.OS === 'ios',
+  }), [user, isLoading, isSyncing, isLocalUser, signInLocally, signInWithApple, signOut, syncData]);
+
+  return contextValue;
+});
